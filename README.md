@@ -1,6 +1,6 @@
 # bidsphysio
 
-This is a modified version of *bidsphysio* package. The original package is accssible [here](https://github.com/cbinyu/bidsphysio).
+This is a modified version of *bidsphysio* package. The original package is accessible [here](https://github.com/cbinyu/bidsphysio).
 
 Converts physio data (CMRR, AcqKnowledge, Siemens PMU) to BIDS physiological recording
 
