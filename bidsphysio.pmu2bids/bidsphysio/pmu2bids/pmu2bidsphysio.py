@@ -56,7 +56,10 @@ import math
 import os
 import re
 import sys
-
+import pydicom
+import json
+from pathlib import Path
+import numpy as np
 from bidsphysio.base.bidsphysio import (PhysioSignal,
                                         PhysioData)
 
@@ -70,6 +73,39 @@ def errmsg(msg, pmuFile, expStr=None, gotStr=None):
         return msg
 
 
+def get_triggers_dicom(dicom_dir, json_file):
+    if not os.path.exists(dicom_dir):
+        raise Exception("Dicom directory does not exist.")
+        
+    if not os.path.exists(json_file):
+        raise Exception("JSON file does not exist.")
+        
+    with open(json_file, 'r') as fp:
+        json_values = json.load(fp)
+        
+    fmri_series_instance_uid = json_values['SeriesInstanceUID']
+    
+    trigger_time = []
+    for dicom_file in Path(dicom_dir).rglob('*'):
+        if dicom_file.is_dir():
+            continue
+
+        try:
+            dcm = pydicom.read_file(dicom_file, stop_before_pixels=True,
+                                    specific_tags=['AcquisitionTime', 'RepetitionTime', 'SeriesInstanceUID'])
+
+            if fmri_series_instance_uid == dcm.SeriesInstanceUID:
+                acq_time = dcm.AcquisitionTime
+                acq_time = float(acq_time[0:2]) * 60 * 60 + float(acq_time[2:4]) * 60 + float(acq_time[4:])
+                trigger_time.append(acq_time * 1000)
+                TR_MRI = float(dcm.RepetitionTime)
+        except:
+            continue
+
+    trigger_time.sort()
+    return (trigger_time, TR_MRI)
+
+
 class PMUFormatError(ValueError):
     """
     Subclass of ValueError with the following additional properties:
@@ -78,6 +114,7 @@ class PMUFormatError(ValueError):
     expStr : The string we expected
     gotStr : The string that didn't match what we expected
     """
+
     def __init__(self, msg, pmuFile, expStr=None, gotStr=None):
         ValueError.__init__(self, errmsg(msg, pmuFile, expStr, gotStr))
         self.msg = msg
@@ -89,7 +126,7 @@ class PMUFormatError(ValueError):
         return self.__class__, (self.msg, self.pmuFile, self.expStr, self.gotStr)
 
 
-def pmu2bids(physio_files, verbose=False):
+def pmu2bids(physio_files, bids_prefix, dicom_dir, verbose=False):
     """
     Function to read a list of Siemens PMU physio files and
     save them as a BIDS physiological recording.
@@ -98,31 +135,56 @@ def pmu2bids(physio_files, verbose=False):
     ----------
     physio_files : list of str
         list of paths to files with a Siemens PMU recording
-    verbose : bool
-        verbose flag
+    bids_prefix : str
+        string with the BIDS filename to save the physio signal (full path)
 
     Returns
     -------
-    physio : PhysioData
-        PhysioData with the contents of the file
+
     """
 
     # In case we are handled just a single file, make it a one-element list:
     if isinstance(physio_files, str):
         physio_files = [physio_files]
+        
+    bidsPrefix = bids_prefix
+    for mystr in ['.gz', '.nii', '_bold', '_physio']:
+            bidsPrefix = bidsPrefix[:-len(mystr)] if bidsPrefix.endswith(mystr) else bidsPrefix
 
+    json_file = bidsPrefix + '_bold.json'
+    
     # Init PhysioData object to hold physio signals:
     physio = PhysioData()
+    mri_trig_time, TR = get_triggers_dicom(dicom_dir=dicom_dir, json_file=json_file)
 
     # Read the files from the list, extract the relevant information and
     #   add a new PhysioSignal to the list:
     for f in physio_files:
         physio_type, MDHTime, sampling_rate, physio_signal = readpmu(f, verbose=verbose)
+        physio_time = np.arange(MDHTime[0], MDHTime[1], 1000/sampling_rate)
+        
+        physio_start_idx = np.argmin(np.abs(physio_time - min(mri_trig_time)))
+        physio_end_idx = np.argmin(np.abs(physio_time - max(mri_trig_time) - TR))
+        MDHTime[0] = round(physio_time[physio_start_idx])
+        
+        if abs(min(mri_trig_time) - MDHTime[0]) < 5:
+            MDHTime[0] = min(mri_trig_time)
+        else:
+            continue
+
+        MDHTime[1] = round(physio_time[physio_end_idx])
+        if abs(max(mri_trig_time) + TR - MDHTime[1]) < 5:
+            MDHTime[1] = max(mri_trig_time) + TR
+        else:
+            continue
+
+        physio_signal = physio_signal[physio_start_idx:(physio_end_idx+1)]
+        physio_time = np.linspace(MDHTime[0], MDHTime[1], len(physio_signal))
 
         testSamplingRate(
-                            sampling_rate = sampling_rate,
-                            Nsamples = len(physio_signal),
-                            logTimes=MDHTime
+            sampling_rate=sampling_rate,
+            Nsamples=len(physio_signal),
+            logTimes=MDHTime
         )
 
         # specify label:
@@ -148,7 +210,29 @@ def pmu2bids(physio_files, verbose=False):
             )
         )
 
-    return physio
+    MDHTime = [0, 1]
+    MDHTime[0] = round(min(mri_trig_time))
+    MDHTime[1] = round(max(mri_trig_time) + TR)
+    trigger_signal = [0 for i in physio_signal]
+    physio_time = np.linspace(MDHTime[0], MDHTime[1], len(physio_signal))
+    for t in mri_trig_time:
+        idx = np.argmin(abs(physio_time - t))
+        trigger_signal[idx] = 1
+
+    physio.append_signal(
+        PhysioSignal(
+            label='trigger',
+            units='',
+            samples_per_second=sampling_rate,
+            physiostarttime=MDHTime[0],
+            signal=trigger_signal
+        )
+    )
+    
+    # Save files:
+    physio.save_to_bids_with_trigger(bids_prefix)
+
+    return
 
 
 def readpmu(physio_file, softwareVersion=None, verbose=False):
@@ -163,8 +247,6 @@ def readpmu(physio_file, softwareVersion=None, verbose=False):
     softwareVersion : str or None (default)
         Siemens scanner software version
         If None (default behavior), it will try all known versions
-    verbose : bool
-        Verbose flag
 
     Returns
     -------
@@ -182,13 +264,13 @@ def readpmu(physio_file, softwareVersion=None, verbose=False):
     """
 
     # Check for known software versions:
-    knownVersions = ['VB15A', 'VE11C', 'VBX']
+    knownVersions = ['VE11C', 'VB15A', 'VBX']
 
     if not (
             softwareVersion in knownVersions or
             # (if None, we'll try all knownVersions)
-            softwareVersion is None
-           ):
+            softwareVersion == None
+    ):
         raise Exception("{sv} is not a known software version.".format(sv=softwareVersion))
 
     # Define what versions we need to test:
@@ -261,7 +343,7 @@ def readVE11Cpmu(physio_file, forceRead=False):
     lines = [line.rstrip() for line in open(physio_file)]
 
     # According to Siemens (IDEA documentation), the sampling rate is 2.5ms for all signals:
-    sampling_rate = int(400)    # 1000/2.5
+    sampling_rate = int(400)  # 1000/2.5
 
     # For that first line, different information regions are bound by "5002 and "6002".
     #   Find them:
@@ -269,11 +351,11 @@ def readVE11Cpmu(physio_file, forceRead=False):
     if len(s) == 1:
         # we failed to find even one "5002 ... 6002" group.
         raise PMUFormatError(
-                  'File %r does not seem to be a valid VE11C PMU file',
-                  physio_file,
-                  '5002(.*?)6002',
-                  s[0]
-              )
+            'File %r does not seem to be a valid VE11C PMU file',
+            physio_file,
+            '5002(.*?)6002',
+            s[0]
+        )
 
     # The first group contains the triggering method, gate open and close times, etc for
     #   compatibility with previous versions. Ignore it.
@@ -284,16 +366,15 @@ def readVE11Cpmu(physio_file, forceRead=False):
         print('Could not find type of recording for ' + physio_file)
         if not forceRead:
             raise PMUFormatError(
-                      'File %r does not seem to be a valid VE11C PMU file',
-                      physio_file,
-                      'LOGVERSION_([A-Z]*)',
-                      s[1]
-                  )
+                'File %r does not seem to be a valid VE11C PMU file',
+                physio_file,
+                'LOGVERSION_([A-Z]*)',
+                s[1]
+            )
         else:
             print('Setting recording type to "Unknown"')
             physio_type = "Unknown"
             # (continue reading the file)
-
 
     # The third and fouth groups we ignore, and the fifth gives us the physio signal itself.
     raw_signal = s[4].split(' ')
@@ -342,24 +423,23 @@ def readVB15Apmu(physio_file, forceRead=False):
 
     # The first line starts with four integers with info about the recording, followed
     #   by the data. So split by spaces:
-    line0 = lines[0].split()
+    line0 = lines[0].split(' ')
     try:
         recInfo = [int(v) for v in line0[:4]]
     except:
         raise PMUFormatError(
-                  'File %r does not seem to be a valid VB15A PMU file',
-                  physio_file,
-                  '"1 2 40 280" or "1 2 20 2"',
-                  str(line0[:4])
-              )
+            'File %r does not seem to be a valid VB15A PMU file',
+            physio_file,
+            '"1 2 40 280" or "1 2 20 2"',
+            str(line0[:4])
+        )
 
-    raw_signal = line0[4:]     # we'll transform the signal to int later
+    raw_signal = line0[4:]  # we'll transform the signal to int later
 
     # According to Siemens (IDEA documentation), the sampling rate is 50 samples/s for all signals:
     sampling_rate = int(50)
 
     # Check the recording. These are fixed:
-    physio_type = None
     if recInfo == [1, 2, 40, 280]:
         physio_type = 'PULS'
     elif recInfo == [1, 2, 20, 2]:
@@ -368,21 +448,21 @@ def readVB15Apmu(physio_file, forceRead=False):
         print('Unknown type of recording for ' + physio_file)
         if not forceRead:
             raise PMUFormatError(
-                      'File %r does not seem to be a valid VB15A PMU file',
-                      physio_file,
-                      '"1 2 40 280" or "1 2 20 2"',
-                      str(recInfo)
-                  )
+                'File %r does not seem to be a valid VB15A PMU file',
+                physio_file,
+                '"1 2 40 280" or "1 2 20 2"',
+                str(recInfo)
+            )
 
     # VB files continue with physio data right away. VE files continue with some more
     #   information, starting with the code "5002":
     if raw_signal[0] == '5002':
         raise PMUFormatError(
-                  'File %r does not seem to be a valid VB15A PMU file',
-                  physio_file,
-                  'not 5002',
-                  '5002 [...]'
-              )
+            'File %r does not seem to be a valid VB15A PMU file',
+            physio_file,
+            'not 5002',
+            '5002 [...]'
+        )
 
     physio_signal = parserawPMUsignal(raw_signal)
 
@@ -432,11 +512,11 @@ def readVBXpmu(physio_file, forceRead=False):
     if len(s) == 1:
         # we failed to find even one "5002 ... 6002" group.
         raise PMUFormatError(
-                  'File %r does not seem to be a valid VBX PMU file',
-                  physio_file,
-                  '5002(.*?)6002',
-                  s[0]
-              )
+            'File %r does not seem to be a valid VBX PMU file',
+            physio_file,
+            '5002(.*?)6002',
+            s[0]
+        )
 
     # The first group contains the triggering method, gate open and close times, etc for
     #   compatibility with previous versions. Ignore it.
@@ -447,11 +527,11 @@ def readVBXpmu(physio_file, forceRead=False):
         print('Could not find type of recording for ' + physio_file)
         if not forceRead:
             raise PMUFormatError(
-                      'File %r does not seem to be a valid VBX PMU file',
-                      physio_file,
-                      'Logging ([A-Z]*) signal',
-                      s[1]
-                  )
+                'File %r does not seem to be a valid VBX PMU file',
+                physio_file,
+                'Logging ([A-Z]*) signal',
+                s[1]
+            )
         else:
             print('Setting recording type to "Unknown"')
             physio_type = "Unknown"
@@ -463,11 +543,11 @@ def readVBXpmu(physio_file, forceRead=False):
     except AttributeError:
         print('Could not find the sampling rate for ' + physio_file)
         raise PMUFormatError(
-                  'File %r does not seem to be a valid VBX PMU file',
-                  physio_file,
-                  '_SAMPLES_PER_SECOND = ([0-9]*)',
-                  s[1]
-              )
+            'File %r does not seem to be a valid VBX PMU file',
+            physio_file,
+            '_SAMPLES_PER_SECOND = ([0-9]*)',
+            s[1]
+        )
 
     # The third group gives us the physio signal itself.
     raw_signal = s[2].split(' ')
@@ -502,69 +582,76 @@ def getPMUtiming(lines):
 
     """
 
-    MPCUTime = [0,0]
-    MDHTime = [0,0]
+    MPCUTime = [0, 0]
+    MDHTime = [0, 0]
     for l in lines:
         if 'MPCUTime' in l:
             ls = l.split()
             if 'LogStart' in l:
-                MPCUTime[0]= int(ls[1])
+                MPCUTime[0] = int(ls[1])
             elif 'LogStop' in l:
-                MPCUTime[1]= int(ls[1])
+                MPCUTime[1] = int(ls[1])
         if 'MDHTime' in l:
             ls = l.split()
             if 'LogStart' in l:
-                MDHTime[0]= int(ls[1])
+                MDHTime[0] = int(ls[1])
             elif 'LogStop' in l:
-                MDHTime[1]= int(ls[1])
+                MDHTime[1] = int(ls[1])
 
     return MPCUTime, MDHTime
 
 
-def parserawPMUsignal(signal):
+def parserawPMUsignal(raw_signal):
     """
     Function to parse raw physio signal.
 
     Parameters
     ----------
-    signal : list of str
+    raw_signal : list of str
         list with raw PMU signal
 
     Returns
     -------
-    signal : list of int
-        parsed signal. NaN indicate points for which there was no recording
+    physio_signal : list of int
+        signal proper. NaN indicate points for which there was no recording
         (the scanner found a trigger in the signal)
     """
 
     # Sometimes, there is an empty string ('') at the beginning of the string. Remove it:
-    if signal[0] == '':
-        signal = signal[1:]
+    if raw_signal[0] == '':
+        raw_signal = raw_signal[1:]
 
     # Convert to integers:
-    signal = [int(v) for v in signal]
+    raw_signal = [int(v) for v in raw_signal]
 
     # only keep up to "5003" (indicates end of signal recording):
     try:
-        signal = signal[:signal.index(5003)]
+        raw_signal = raw_signal[:raw_signal.index(5003)]
     except ValueError:
         print("Warning: End of physio recording not found. Keeping whole data")
 
     # Values "5000" and "6000" indicate "trigger on" and "trigger off", respectively, so they
     #   are not a real physio_signal value. So replace them with NaN:
-    for idx, v in enumerate(signal):
-        if v == 5000 or v == 6000:
-            signal[idx] = float('NaN')
+    physio_signal = raw_signal
+    physio_signal = [x for x in physio_signal if x != 5000]
+    physio_signal = [x for x in physio_signal if x != 6000]
+    physio_signal = [x for x in physio_signal if x != 5003]
+    physio_signal = [x for x in physio_signal if x != 6002]
 
-    return signal
+    # for idx, v in enumerate(raw_signal):
+    #    if v == 5000 or v == 6000:
+    #        pass
+    # physio_signal[idx] = float('NaN')
+
+    return physio_signal
 
 
 def testSamplingRate(
         sampling_rate=0,
         Nsamples=0,
-        logTimes=[0,0],
+        logTimes=[0, 0],
         tolerance=0.1
-        ):
+):
     """
     Function to test if the sampling rate is correct.
     If it is incorrect, it will raise a ValueError
@@ -584,26 +671,28 @@ def testSamplingRate(
     -------
     """
 
-    if not (1 > tolerance > 0):
+    if not (tolerance < 1 and tolerance > 0):
         raise ValueError('tolerance has to be between 0 and 1. Got ' + str(tolerance))
 
-    loggingTime_sec = (logTimes[1] - logTimes[0])/1000
+    loggingTime_sec = (logTimes[1] - logTimes[0]) / 1000
     expected_samples = int(loggingTime_sec * sampling_rate)
     if not math.isclose(Nsamples, expected_samples, rel_tol=tolerance):
         raise ValueError(
             'Expected sampling rate: {expected}. Got: {got}'.format(
-                expected=int(Nsamples/loggingTime_sec),
+                expected=int(Nsamples / loggingTime_sec),
                 got=sampling_rate
             )
         )
 
 
 def main():
-
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Convert Siemens physiology files to BIDS-compliant physiology recording')
+    parser = argparse.ArgumentParser(
+        description='Convert Siemens physiology files to BIDS-compliant physiology recording')
     parser.add_argument('-i', '--infiles', nargs='+', required=True, help='.puls or .resp physio file(s)')
-    parser.add_argument('-b', '--bidsprefix', required=True, help='Prefix of the BIDS file. It should match the _bold.nii.gz')
+    parser.add_argument('-b', '--bidsprefix', required=True,
+                        help='Prefix of the BIDS file. It should match the _bold.nii.gz')
+    parser.add_argument('-d', '--dicom', required=True, help='Dicom directory.')
     parser.add_argument('-v', '--verbose', action="store_true", default=False, help='verbose screen output')
     args = parser.parse_args()
 
@@ -617,11 +706,9 @@ def main():
     if not os.path.exists(odir):
         os.makedirs(odir)
 
-    physio_data = pmu2bids(args.infiles, verbose=args.verbose)
-    if physio_data.labels():
-        physio_data.save_to_bids_with_trigger(args.bidsprefix)
+    pmu2bids(args.infiles, args.bidsprefix, args.dicom, verbose=args.verbose)
+
 
 # This is the standard boilerplate that calls the main() function.
 if __name__ == '__main__':
     main()
-
